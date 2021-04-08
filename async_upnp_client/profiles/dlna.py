@@ -56,7 +56,7 @@ class DlnaOrgPs(Enum):
     NORMAL = 1
 
 
-class DlanOrgFlags(Enum):
+class DlnaOrgFlags(Enum):
     """
     DLNA.ORG_FLAGS flags.
 
