@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from enum import Enum
 from mimetypes import guess_type
-from typing import Any, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, List, Iterable, Mapping, MutableMapping, Optional, Sequence, Union
 from urllib.parse import quote_plus, urlparse, urlunparse
 from xml.sax.handler import ContentHandler, ErrorHandler
 
@@ -20,6 +20,9 @@ from async_upnp_client.utils import absolute_url, str_to_time, time_to_str
 
 _LOGGER = logging.getLogger(__name__)
 
+METADATA_FILTER_ALL = "*"
+DEFAULT_METADATA_FILTER = METADATA_FILTER_ALL
+DEFAULT_SORT_CRITERIA = []
 
 DeviceState = Enum("DeviceState", "ON PLAYING PAUSED IDLE")
 
@@ -912,5 +915,195 @@ class DmrDevice(UpnpProfileDevice):
 
         return state_var.updated_at
 
+    # endregion
 
-# endregion
+class DmsDevice(UpnpProfileDevice):
+    """Representation of a DLNA DMS device."""
+
+    DEVICE_TYPES = [
+        "urn:schemas-upnp-org:device:MediaServer:1",
+        "urn:schemas-upnp-org:device:MediaServer:2",
+        "urn:schemas-upnp-org:device:MediaServer:3",
+        "urn:schemas-upnp-org:device:MediaServer:4",
+    ]
+
+    _SERVICE_TYPES = {
+        "CD": {
+            "urn:schemas-upnp-org:service:ContentDirectory:4",
+            "urn:schemas-upnp-org:service:ContentDirectory:3",
+            "urn:schemas-upnp-org:service:ContentDirectory:2",
+            "urn:schemas-upnp-org:service:ContentDirectory:1",
+        },
+        "CM": {
+            "urn:schemas-upnp-org:service:ConnectionManager:3",
+            "urn:schemas-upnp-org:service:ConnectionManager:2",
+            "urn:schemas-upnp-org:service:ConnectionManager:1",
+        },
+    }
+
+    async def async_update(self) -> None:
+        """Retrieve the latest data."""
+        # Retrieve changeable values
+        await self._async_poll_state_variable("CD", "SystemUpdateID", "Id")
+
+        # Retrieve unchanging state variables only once
+        for var_name, res_name in [
+            ("SearchCapabilities", "SearchCaps"),
+            ("SortCapabilities", "SortCaps"),
+            ]:
+            state_variable = self._state_variable("CD", var_name)
+            if state_variable.updated_at is None:
+                await self._async_poll_state_variable("CD", var_name, res_name)
+
+    async def _async_poll_state_variable(
+        self,
+        service_name: str,
+        variable_name: str,
+        result_name: str
+    ) -> None:
+        """Update a state variable."""
+        action = self._action(service_name, f"Get{variable_name}")
+        if not action:
+            return
+        result = await action.async_call()
+
+        changed = []
+
+        state_variable = self._state_variable(service_name, variable_name)
+        if state_variable:
+            state_variable.value = result[result_name]
+            changed.append(state_variable)
+
+        self._on_event(action.service, changed)
+
+    def get_absolute_url(self, url: str) -> str:
+        """Resolve a URL returned by the device into an absolute URL"""
+        return absolute_url(self.device.device_url, url)
+
+    # region CD
+    @property
+    def search_capabilities(self) -> Optional[List[str]]:
+        """The list of capabilities that are supported for search"""
+        state_var = self._state_variable("CD", "SearchCapabilities")
+        if state_var is None or state_var.value is None:
+            return None
+
+        return state_var.value.split(",")
+
+    @property
+    def sort_capabilities(self) -> Optional[List[str]]:
+        """The list of meta-data tags that can be used in sort_criteria"""
+        state_var = self._state_variable("CD", "SortCapabilities")
+        if state_var is None or state_var.value is None:
+            return None
+
+        return state_var.value.split(",")
+
+    @property
+    def system_update_id(self) -> Optional[int]:
+        """Returns the latest update SystemUpdateID.
+
+        Changes to this ID indicate that changes have occurred in the Content
+        Directory. Polling this is an alternative to subscribing to events.
+        """
+        state_var = self._state_variable("CD", "SystemUpdateID")
+        if state_var is None or state_var.value is None:
+            return None
+
+        return state_var.value
+
+    async def async_browse(
+        self,
+        object_id: str,
+        browse_flag: str,
+        metadata_filter: Union[Iterable[str], str] = DEFAULT_METADATA_FILTER,
+        starting_index: int = 0,
+        requested_count: int = 0,
+        sort_criteria: Union[Iterable[str], str] = DEFAULT_SORT_CRITERIA,
+    ) -> List[didl_lite.DidlObject]:
+        """Retrieve an object's metadata or its children"""
+        action = self._action("CD", "Browse")
+        if not action:
+            raise UpnpError("Missing action CD/Browse")
+        if not isinstance(metadata_filter, str):
+            metadata_filter = ",".join(metadata_filter)
+        if not isinstance(sort_criteria, str):
+            sort_criteria = ",".join(sort_criteria)
+        result = await action.async_call(
+            ObjectID=object_id,
+            BrowseFlag=browse_flag,
+            Filter=metadata_filter,
+            StartingIndex=starting_index,
+            RequestedCount=requested_count,
+            SortCriteria=sort_criteria,
+        )
+        # TODO: if object_id == "0" then use UpdateID to update SystemUpdateID
+        return didl_lite.from_xml_string(result["Result"], strict=False)
+
+    async def async_browse_metadata(
+        self,
+        object_id: str,
+        metadata_filter: Union[Iterable[str], str] = DEFAULT_METADATA_FILTER
+    ) -> didl_lite.DidlObject:
+        """Convenience function to Browse only the metadata of an object"""
+        result = await self.async_browse(
+            object_id,
+            "BrowseMetadata",
+            metadata_filter,
+        )
+        return result[0]
+
+    async def async_browse_direct_children(
+        self,
+        object_id: str,
+        metadata_filter: Union[Iterable[str], str] = DEFAULT_METADATA_FILTER,
+        starting_index: int = 0,
+        requested_count: int = 0,
+        sort_criteria: Union[Iterable[str], str] = DEFAULT_SORT_CRITERIA,
+    ) -> List[didl_lite.DidlObject]:
+        """Convenience function to Browse the direct children of an object.
+
+        For example, this will return a list of Container contents.
+        """
+        return await self.async_browse(
+            object_id,
+            "BrowseDirectChildren",
+            metadata_filter,
+            starting_index,
+            requested_count,
+            sort_criteria,
+        )
+
+    async def async_search_directory(
+        self,
+        container_id: str,
+        search_criteria: str,
+        metadata_filter: Union[Iterable[str], str] = DEFAULT_METADATA_FILTER,
+        starting_index: int = 0,
+        requested_count: int = 0,
+        sort_criteria: Union[Iterable[str], str] = DEFAULT_SORT_CRITERIA,
+    ):
+        """Search ContentDirectory for objects that match some criteria.
+
+        NOTE: This is not UpnpProfileDevice.async_search, which searches for
+        matching UPNP devices.
+        """
+        action = self._action("CD", "Search")
+        if not action:
+            raise UpnpError("Missing action CD/Search")
+        if not isinstance(metadata_filter, str):
+            metadata_filter = ",".join(metadata_filter)
+        if not isinstance(sort_criteria, str):
+            sort_criteria = ",".join(sort_criteria)
+        result = await action.async_call(
+            ContainerID=container_id,
+            SearchCriteria=search_criteria,
+            Filter=metadata_filter,
+            StartingIndex=starting_index,
+            RequestedCount=requested_count,
+            SortCriteria=sort_criteria,
+        )
+        # TODO: if object_id == "0" then use UpdateID to update SystemUpdateID
+        return didl_lite.from_xml_string(result["Result"], strict=False)
+
+    # endregion
