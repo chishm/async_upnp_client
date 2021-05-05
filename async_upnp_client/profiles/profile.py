@@ -14,6 +14,7 @@ from async_upnp_client.client import (
     UpnpService,
     UpnpStateVariable,
 )
+from async_upnp_client.device_updater import DeviceUpdater, NotifyAsyncCallbackType
 from async_upnp_client.event_handler import UpnpEventHandler
 from async_upnp_client.search import async_search
 from async_upnp_client.ssdp import SSDP_MX
@@ -65,12 +66,23 @@ class UpnpProfileDevice:
         """Alias for async_search."""
         return await cls.async_search()
 
-    def __init__(self, device: UpnpDevice, event_handler: UpnpEventHandler) -> None:
+    def __init__(
+        self,
+        device: UpnpDevice,
+        event_handler: UpnpEventHandler,
+        device_updater: Optional[DeviceUpdater] = None,
+    ) -> None:
         """Initialize."""
         self.device = device
         self._event_handler = event_handler
+        self._device_updater = device_updater
         self.on_event: Optional[EventCallbackType] = None
         self._icon: Optional[str] = None
+        self._subscribed_to_events = False
+
+        self.async_on_notify: Optional[NotifyAsyncCallbackType] = None
+        if self._device_updater:
+            self._device_updater.add_device(self.device, self._async_on_device_notify)
 
     @property
     def name(self) -> str:
@@ -222,10 +234,12 @@ class UpnpProfileDevice:
         # To have something...
         timeouts.append(SUBSCRIBE_TIMEOUT)
 
+        self._subscribed_to_events = True
         return min(timeouts)
 
     async def async_unsubscribe_services(self) -> None:
         """Unsubscribe from all of our subscribed services."""
+        self._subscribed_to_events = False
         await asyncio.gather(
             (
                 self._event_handler.async_unsubscribe(service)
@@ -245,3 +259,15 @@ class UpnpProfileDevice:
         """
         if self.on_event:
             self.on_event(service, state_variables)  # pylint: disable=not-callable
+
+    async def _async_on_device_notify(self, device: UpnpDevice, reinit: bool) -> None:
+        """Device might have changed availability, location, or services.
+
+        :param device: Device which sent the notification.
+        :param reinit: Device had to be re-initialized.
+        """
+        if self._subscribed_to_events:
+            # Redo subscriptions in case the location has changed or device restarted
+            await self.async_subscribe_services()
+        if self.async_on_notify:
+            await self.async_on_notify(device, reinit)
