@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """UPnP event handler module."""
 
+import asyncio
 import logging
 import urllib.parse
 from datetime import datetime, timedelta
@@ -279,11 +280,16 @@ class UpnpEventHandler:
 
         return True, sid, new_timeout
 
-    async def async_resubscribe_all(self) -> None:
-        """Renew all current subscription."""
-        for entry in self._subscriptions.values():
-            service = entry.service
-            await self.async_resubscribe(service)
+    async def async_resubscribe_all(self) -> datetime:
+        """Renew all current subscription.
+
+        Return the next time that this must be done.
+        """
+        await asyncio.gather(
+            self.async_resubscribe(entry.service)
+            for entry in self._subscriptions.values()
+        )
+        return min(service.renewal_time for service in self._subscriptions.values())
 
     async def async_unsubscribe(
         self, service: "UpnpService"
@@ -318,6 +324,6 @@ class UpnpEventHandler:
     async def async_unsubscribe_all(self) -> None:
         """Unsubscribe all subscriptions."""
         services = self._subscriptions.copy()
-        for entry in services.values():
-            service = entry.service
-            await self.async_unsubscribe(service)
+        await asyncio.gather(
+            self.async_unsubscribe(entry.service) for entry in services.values()
+        )
