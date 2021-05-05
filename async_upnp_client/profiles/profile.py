@@ -4,7 +4,6 @@
 import asyncio
 import logging
 from datetime import timedelta
-from ipaddress import IPv4Address
 from typing import Dict, List, Mapping, Optional, Sequence, Set
 
 from async_upnp_client.client import (
@@ -17,7 +16,7 @@ from async_upnp_client.client import (
 from async_upnp_client.device_updater import DeviceUpdater, NotifyAsyncCallbackType
 from async_upnp_client.event_handler import UpnpEventHandler
 from async_upnp_client.search import async_search
-from async_upnp_client.ssdp import SSDP_MX
+from async_upnp_client.ssdp import IPvXAddress, SSDP_MX
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,7 +37,9 @@ class UpnpProfileDevice:
 
     @classmethod
     async def async_search(
-        cls, source_ip: Optional[IPv4Address] = None, timeout: int = SSDP_MX
+        cls,
+        source_ip: Optional[IPvXAddress] = None,
+        timeout: int = SSDP_MX,
     ) -> Set[Mapping[str, str]]:
         """
         Search for this device type.
