@@ -140,3 +140,38 @@ async def async_search(
     await asyncio.sleep(timeout)
 
     listener.async_stop()
+
+
+async def async_find_device(
+    udn: str,
+    timeout: int = SSDP_MX,
+    source_ip: Optional[IPvXAddress] = None,
+    loop: Optional[AbstractEventLoop] = None,
+) -> Optional[str]:
+    """Find a specific device's location URL from its UDN.
+
+    Returns the URL, or None if the device does not response within the timeout.
+    """
+    loop_: AbstractEventLoop = loop or asyncio.get_event_loop()
+    response: asyncio.Future[str] = loop_.create_future()
+
+    async def on_response(data: Mapping[str, str]) -> None:
+        if "st" in data and data["st"] == udn and not response.done():
+            response.set_result(data["location"])
+
+    search_task = loop_.create_task(
+        async_search(
+            async_callback=on_response,
+            timeout=timeout,
+            service_type=udn,
+            source_ip=source_ip,
+            loop=loop_,
+        )
+    )
+
+    asyncio.wait((search_task, response), return_when=asyncio.FIRST_COMPLETED)
+
+    if response.done():
+        return response.result()
+    else:
+        return None
