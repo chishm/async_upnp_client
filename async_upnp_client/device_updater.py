@@ -18,6 +18,7 @@ from types import MethodType
 import weakref
 
 from async_upnp_client import UpnpAdvertisementListener, UpnpDevice, UpnpFactory
+from async_upnp_client.ssdp import IPvXAddress
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class DeviceUpdater:
         self,
         device: Union[UpnpDevice, Iterable[UpnpDevice], None],
         factory: UpnpFactory,
-        source_ip: Optional[IPv4Address] = None,
+        source_ip: Optional[IPvXAddress] = None,
     ) -> None:
         """Initialize."""
         # Don't keep the device object alive if nothing else is using it anymore
