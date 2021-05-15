@@ -79,7 +79,7 @@ class UpnpProfileDevice:
         self._device_updater = device_updater
         self.on_event: Optional[EventCallbackType] = None
         self._icon: Optional[str] = None
-        self._subscribed_to_events = False
+        self._subscribed_to_services = False
 
         self.async_on_notify: Optional[NotifyAsyncCallbackType] = None
         if self._device_updater:
@@ -194,53 +194,39 @@ class UpnpProfileDevice:
         return False
 
     async def async_subscribe_services(self) -> timedelta:
-        """(Re-)Subscribe to services."""
-        timeouts: List[timedelta] = []
+        """(Re-)Subscribe to services.
+
+        Calling this function for *resubscription* is only necessary if no
+        device_updater was supplied, and the device has changed location or
+        configuration. Otherwise, resubscription will be handled automatically.
+        """
         for service in self.device.services.values():
             # ensure we are interested in this service_type
             if not self._interesting_service(service):
                 continue
 
-            on_event: EventCallbackType = self._on_event
-            service.on_event = on_event
-            if self._event_handler.sid_for_service(service) is None:
-                _LOGGER.debug("Subscribing to service: %s", service)
-                success, _, timeout = await self._event_handler.async_subscribe(
-                    service, timeout=SUBSCRIBE_TIMEOUT
-                )
-                if not success:
-                    _LOGGER.debug("Failed subscribing to: %s", service)
-                elif timeout:
-                    timeouts.append(timeout)
-            else:
-                _LOGGER.debug("Resubscribing to service: %s", service)
-                success, _, timeout = await self._event_handler.async_resubscribe(
-                    service, timeout=SUBSCRIBE_TIMEOUT
-                )
+            service.on_event = self._on_event
 
-                # could not renew subscription, try subscribing again
-                if not success:
-                    _LOGGER.debug("Failed resubscribing to: %s", service)
+            _LOGGER.debug("(Re)-subscribing to service: %s", service)
+            sid = await self._event_handler.async_subscribe(
+                service, timeout=SUBSCRIBE_TIMEOUT
+            )
+            if not sid:
+                _LOGGER.debug("Failed subscribing to: %s", service)
 
-                    success, _, timeout = await self._event_handler.async_subscribe(
-                        service, timeout=SUBSCRIBE_TIMEOUT
-                    )
-                    if not success:
-                        _LOGGER.debug("Failed subscribing to: %s", service)
-                    elif timeout:
-                        timeouts.append(timeout)
-                elif timeout:
-                    timeouts.append(timeout)
-
-        # To have something...
-        timeouts.append(SUBSCRIBE_TIMEOUT)
-
-        self._subscribed_to_events = True
-        return min(timeouts)
+        self._subscribed_to_services = True
+        return SUBSCRIBE_TIMEOUT
 
     async def async_unsubscribe_services(self) -> None:
         """Unsubscribe from all of our subscribed services."""
-        self._subscribed_to_events = False
+        self._subscribed_to_services = False
+        await self._do_unsubscribe_services()
+
+    async def _do_unsubscribe_services(self) -> None:
+        """Unsubscribe from all subscribed services, ignoring exceptions.
+
+        Internal method that does not change _subscribed_to_services
+        """
         await asyncio.gather(
             (
                 self._event_handler.async_unsubscribe(service)
@@ -267,8 +253,12 @@ class UpnpProfileDevice:
         :param device: Device which sent the notification.
         :param reinit: Device had to be re-initialized.
         """
-        if self._subscribed_to_events:
-            # Redo subscriptions in case the location has changed or device restarted
-            await self.async_subscribe_services()
+        if self._subscribed_to_services:
+            if device.available:
+                # Redo subscriptions in case the location has changed or device restarted
+                await self.async_subscribe_services()
+            else:
+                # Clear out all subscriptions
+                await self._do_unsubscribe_services()
         if self.async_on_notify:
             await self.async_on_notify(device, reinit)
