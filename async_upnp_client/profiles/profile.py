@@ -20,7 +20,6 @@ from async_upnp_client.ssdp import IPvXAddress, SSDP_MX
 
 _LOGGER = logging.getLogger(__name__)
 
-
 SUBSCRIBE_TIMEOUT = timedelta(minutes=9)
 
 
