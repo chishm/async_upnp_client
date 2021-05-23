@@ -2,12 +2,14 @@
 """UPnP event handler module."""
 
 import asyncio
+import dataclasses
 import logging
 import urllib.parse
 from datetime import datetime, timedelta
 from http import HTTPStatus
 import socket
-from typing import Dict, Mapping, NamedTuple, Optional, Tuple
+from typing import Dict, Mapping, Optional, Tuple, Union
+import weakref
 
 import defusedxml.ElementTree as DET
 
@@ -22,10 +24,11 @@ DEFAULT_SUBSCRIPTION_TIMEOUT = timedelta(seconds=1800)
 RESUBSCRIBE_THRESHOLD = timedelta(seconds=60)
 
 
-SubscriptionInfo = NamedTuple(
-    "SubscriptionInfo",
-    [("service", UpnpService), ("timeout", timedelta), ("renewal_time", datetime)],
-)
+@dataclasses.dataclass
+class SubscriptionInfo:
+    service: weakref.ReferenceType[UpnpService]
+    timeout: timedelta
+    renewal_time: datetime
 
 
 class UpnpEventHandler:
@@ -98,7 +101,7 @@ class UpnpEventHandler:
     def sid_for_service(self, service: UpnpService) -> Optional[str]:
         """Get the service connected to SID."""
         for sid, entry in self._subscriptions.items():
-            if entry.service == service:
+            if entry.service() == service:
                 return sid
 
         return None
@@ -108,7 +111,29 @@ class UpnpEventHandler:
         if sid not in self._subscriptions:
             return None
 
-        return self._subscriptions[sid].service
+        service = self._subscriptions[sid].service()
+        if not service:
+            # Clear the SubscriptionInfo now that the associated service is gone
+            del self._subscriptions[sid]
+            return None
+
+        return service
+
+    def _sid_and_service(
+        self, service_or_sid: Union[UpnpService, str]
+    ) -> Tuple[Optional[str], Optional[UpnpService]]:
+        """Resolve a SID or service to both SID and service."""
+        sid: Optional[str]
+        service: Optional[UpnpService]
+
+        if isinstance(service_or_sid, UpnpService):
+            service = service_or_sid
+            sid = self.sid_for_service(service)
+        else:
+            sid = service_or_sid
+            service = self.service_for_sid(sid)
+
+        return sid, service
 
     async def handle_notify(self, headers: Mapping[str, str], body: str) -> HTTPStatus:
         """Handle a NOTIFY request."""
@@ -145,6 +170,18 @@ class UpnpEventHandler:
             _LOGGER_TRAFFIC_UPNP.debug("Sending response: %s", HTTPStatus.OK)
             return HTTPStatus.OK
 
+        service = self.service_for_sid(sid)
+        if not service:
+            # SID was known, but service object has been deleted. Send an error
+            # to the device. The service has been removed from _subscriptions,
+            # this error won't happen a second time.
+            _LOGGER.warning("Received NOTIFY for dead UpnpService, SID: %s", sid)
+
+            _LOGGER_TRAFFIC_UPNP.debug(
+                "Sending response: %s", HTTPStatus.PRECONDITION_FAILED
+            )
+            return HTTPStatus.PRECONDITION_FAILED
+
         # decode event and send updates to service
         changes = {}
         stripped_body = body.rstrip(" \t\r\n\0")
@@ -156,11 +193,46 @@ class UpnpEventHandler:
                 changes[name] = value
 
         # send changes to service
-        service = self._subscriptions[sid].service
         service.notify_changed_state_variables(changes)
 
         _LOGGER_TRAFFIC_UPNP.debug("Sending response: %s", HTTPStatus.OK)
         return HTTPStatus.OK
+
+    def _add_subscription(
+        self, sid: str, service: UpnpService, timeout: timedelta
+    ) -> SubscriptionInfo:
+        """Add a subscription to the _subscriptions array.
+
+        :return: The subscription
+        """
+        if sid in self._subscriptions:
+            raise ValueError("Existing SID")
+
+        def _finalize_callback(ref: weakref.ref) -> None:
+            """Finalize a subscription that is being deleted.
+
+            Remove it from our list of subscriptions.
+
+            DO NOT unsubscribe here, we may not be in the right async context.
+            Issue a warning instead.
+            """
+            del ref  # Unused
+            try:
+                self._subscriptions.pop(sid)
+            except KeyError:
+                # Old key that we didn't do anything with?
+                _LOGGER.warning("Unknown SID to finalize %s", sid)
+            else:
+                _LOGGER.warning(
+                    "Subscription with SID %s was not unsubscribed before deletion", sid
+                )
+
+        self._subscriptions[sid] = SubscriptionInfo(
+            service=weakref.ref(service, callback=_finalize_callback),
+            timeout=timeout,
+            renewal_time=datetime.now() + timeout,
+        )
+        return self._subscriptions[sid]
 
     async def _async_do_subscribe(
         self,
@@ -212,13 +284,8 @@ class UpnpEventHandler:
             new_timeout = timedelta(seconds=timeout_seconds)
 
         sid = response_headers["sid"]
-        renewal_time = datetime.now() + new_timeout
-        self._subscriptions[sid] = SubscriptionInfo(
-            service=service,
-            timeout=timeout,
-            renewal_time=renewal_time,
-        )
-        _LOGGER.debug("Got SID: %s, renewal_time: %s", sid, renewal_time)
+        subscription = self._add_subscription(sid, service, new_timeout)
+        _LOGGER.debug("Got SID: %s, renewal_time: %s", sid, subscription.renewal_time)
 
         # replay any backlog we have for this service
         if sid in self._backlog:
@@ -230,19 +297,18 @@ class UpnpEventHandler:
         return sid
 
     async def _async_do_resubscribe(
-        self, service: UpnpService, timeout: Optional[timedelta] = None
+        self,
+        sid: str,
+        service: UpnpService,
+        timeout: Optional[timedelta] = None,
     ) -> Optional[str]:
         """Renew existing subscription to a UpnpService.
 
-        :return SID on success, None on failure
+        :return New SID on success, None on failure
         """
         _LOGGER.debug("Resubscribing to: %s", service)
 
         # do SUBSCRIBE request
-        sid = self.sid_for_service(service)
-        if not sid:
-            raise UpnpError("Could not find SID for service")
-
         if timeout is None:
             timeout = self._subscriptions[sid].timeout
 
@@ -265,6 +331,8 @@ class UpnpEventHandler:
         if "sid" in response_headers and response_headers["sid"]:
             new_sid: str = response_headers["sid"]
             if new_sid != sid:
+                # Move the subscription to the right key in _subscriptions
+                self._subscriptions[new_sid] = self._subscriptions[sid]
                 del self._subscriptions[sid]
                 sid = new_sid
 
@@ -279,19 +347,16 @@ class UpnpEventHandler:
             timeout_seconds = int(response_timeout[7:])  # len("Second-") == 7
             new_timeout = timedelta(seconds=timeout_seconds)
 
-        renewal_time = datetime.now() + new_timeout
-        self._subscriptions[sid] = SubscriptionInfo(
-            service=service,
-            timeout=timeout,
-            renewal_time=renewal_time,
-        )
-        _LOGGER.debug("Got SID: %s, renewal_time: %s", sid, renewal_time)
+        subscription = self._subscriptions[sid]
+        subscription.timeout = new_timeout
+        subscription.renewal_time = datetime.now() + new_timeout
+        _LOGGER.debug("Got SID: %s, renewal_time: %s", sid, subscription.renewal_time)
 
         return sid
 
     async def async_subscribe(
         self,
-        service: UpnpService,
+        service_or_sid: Union[UpnpService, str],
         timeout: Optional[timedelta] = None,
     ) -> Optional[str]:
         """Subscribe or resubscribe to a UpnpService.
@@ -300,14 +365,17 @@ class UpnpEventHandler:
         :param timeout Timeout of subscription
         :return SID on success, None on failure
         """
-        try:
-            sid = await self._async_do_resubscribe(service, timeout)
-        except UpnpError:
-            sid = None
+        sid, service = self._sid_and_service(service_or_sid)
+        if not service:
+            _LOGGER.debug("Unknown service for %s", service_or_sid)
+            return None
 
-        # Resubscribe failed. Maybe there was no subscription or the device
-        # location changed. Delete any old subscription and create a new one.
+        if sid:
+            sid = await self._async_do_resubscribe(sid, service, timeout)
+
         if not sid:
+            # Resubscribe failed. Maybe there was no subscription or the device
+            # location changed. Delete any old subscription and create a new one.
             sid = self.sid_for_service(service)
             if sid and sid in self._subscriptions:
                 del self._subscriptions[sid]
@@ -320,14 +388,11 @@ class UpnpEventHandler:
         return sid
 
     async def async_resubscribe_all(self) -> datetime:
-        """Renew all current subscription.
+        """Renew all current subscriptions.
 
         Return the next time that this must be done.
         """
-        await asyncio.gather(
-            self.async_resubscribe(entry.service)
-            for entry in self._subscriptions.values()
-        )
+        await asyncio.gather(self.async_subscribe(sid) for sid in self._subscriptions)
         return min(service.renewal_time for service in self._subscriptions.values())
 
     async def _resubscribe_loop(self) -> None:
@@ -343,8 +408,8 @@ class UpnpEventHandler:
 
             renewal_threshold = datetime.now() + RESUBSCRIBE_THRESHOLD
             await asyncio.gather(
-                self.async_subscribe(entry.service, entry.timeout)
-                for entry in self._subscriptions.values()
+                self.async_subscribe(sid, entry.timeout)
+                for sid, entry in self._subscriptions.items()
                 if entry.renewal_time < renewal_threshold
             )
 
@@ -368,19 +433,24 @@ class UpnpEventHandler:
             await self._resubscriber_task
             self._resubscriber_task = None
 
-    async def async_unsubscribe(self, service: UpnpService) -> Optional[str]:
+    async def async_unsubscribe(
+        self, service_or_sid: Union[UpnpService, str]
+    ) -> Optional[str]:
         """Unsubscribe from a UpnpService.
 
         :return Unsubscribed SID on success, None on failure
         """
-        _LOGGER.debug("Unsubscribing from: %s, device: %s", service, service.device)
+        sid, service = self._sid_and_service(service_or_sid)
 
-        # do UNSUBSCRIBE request
-        sid = self.sid_for_service(service)
-        if not sid:
-            _LOGGER.debug("Could not determine SID to unsubscribe")
+        if not sid or not service:
+            _LOGGER.debug("Could not determine what to unsubscribe: %s")
             return None
 
+        _LOGGER.debug(
+            "Unsubscribing service %s from device %s", service, service.device
+        )
+
+        # do UNSUBSCRIBE request
         headers = {
             "HOST": urllib.parse.urlparse(service.event_sub_url).netloc,
             "SID": sid,
@@ -395,8 +465,7 @@ class UpnpEventHandler:
             return None
 
         # remove registration
-        if sid in self._subscriptions:
-            del self._subscriptions[sid]
+        del self._subscriptions[sid]
 
         await self._update_resubscriber_task()
 
@@ -405,6 +474,4 @@ class UpnpEventHandler:
     async def async_unsubscribe_all(self) -> None:
         """Unsubscribe all subscriptions."""
         services = self._subscriptions.copy()
-        await asyncio.gather(
-            self.async_unsubscribe(entry.service) for entry in services.values()
-        )
+        await asyncio.gather(self.async_unsubscribe(sid) for sid in services)
