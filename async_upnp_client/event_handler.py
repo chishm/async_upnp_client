@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """UPnP event handler module."""
 
+import aiohttp
 import asyncio
 import dataclasses
 import logging
@@ -13,7 +14,7 @@ import weakref
 
 import defusedxml.ElementTree as DET
 
-from async_upnp_client.client import UpnpError, UpnpRequester, UpnpService
+from async_upnp_client.client import UpnpRequester, UpnpService
 from async_upnp_client.const import NS
 from async_upnp_client.utils import async_get_local_ip, get_local_ip
 
@@ -317,9 +318,23 @@ class UpnpEventHandler:
             "SID": sid,
             "TIMEOUT": "Second-" + str(timeout.total_seconds()),
         }
-        response_status, response_headers, _ = await self._requester.async_http_request(
-            "SUBSCRIBE", service.event_sub_url, headers
-        )
+
+        try:
+            (
+                response_status,
+                response_headers,
+                _,
+            ) = await self._requester.async_http_request(
+                "SUBSCRIBE", service.event_sub_url, headers
+            )
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            _LOGGER.debug(
+                "Error %s trying to resubscribe SID %s for device %s",
+                exc,
+                sid,
+                service.device,
+            )
+            return None
 
         # check results
         if response_status != 200:
@@ -375,13 +390,23 @@ class UpnpEventHandler:
 
         if not sid:
             # Resubscribe failed. Maybe there was no subscription or the device
-            # location changed. Delete any old subscription and create a new one.
-            sid = self.sid_for_service(service)
-            if sid and sid in self._subscriptions:
-                del self._subscriptions[sid]
+            # location changed.
+
+            # Check if there was an old subscription before (re)creating.
+            old_sid = self.sid_for_service(service)
+
+            # Try to create a new subscription
             if timeout is None:
                 timeout = DEFAULT_SUBSCRIPTION_TIMEOUT
             sid = await self._async_do_subscribe(service, timeout)
+
+            if sid and old_sid and sid != old_sid:
+                # New subscription succeeded. Delete the old one, it's not needed
+                del self._subscriptions[old_sid]
+            elif not sid and old_sid:
+                # New subscription failed. Don't delete the old one, but return
+                # None to let the caller know.
+                pass
 
         await self._update_resubscriber_task()
 
@@ -407,6 +432,10 @@ class UpnpEventHandler:
                 await asyncio.sleep(wait_time.total_seconds())
 
             renewal_threshold = datetime.now() + RESUBSCRIBE_THRESHOLD
+
+            # TODO: If resubscribe returns None, that means resubscription failed.
+            # TODO: Let service know.
+
             await asyncio.gather(
                 self.async_subscribe(sid, entry.timeout)
                 for sid, entry in self._subscriptions.items()
@@ -455,14 +484,25 @@ class UpnpEventHandler:
             "HOST": urllib.parse.urlparse(service.event_sub_url).netloc,
             "SID": sid,
         }
-        response_status, _, _ = await self._requester.async_http_request(
-            "UNSUBSCRIBE", service.event_sub_url, headers
-        )
 
-        # check results
-        if response_status != 200:
-            _LOGGER.debug("Did not receive 200, but %s", response_status)
-            return None
+        try:
+            response_status, _, _ = await self._requester.async_http_request(
+                "UNSUBSCRIBE", service.event_sub_url, headers
+            )
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            _LOGGER.debug(
+                "Error %s trying to unsubscribe SID %s for device %s",
+                exc,
+                sid,
+                service.device,
+            )
+            # No communication from the device? It's probably unsubscribed now.
+            # Continue on to removing the registration.
+        else:
+            # check results
+            if response_status != 200:
+                _LOGGER.debug("Did not receive 200, but %s", response_status)
+                return None
 
         # remove registration
         del self._subscriptions[sid]
